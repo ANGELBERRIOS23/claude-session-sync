@@ -1,0 +1,95 @@
+import SwiftUI
+import ServiceManagement
+
+@main
+struct ClaudeSessionSyncApp: App {
+    @State private var store = SessionStore()
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+
+    var body: some Scene {
+        MenuBarExtra {
+            VStack(spacing: 0) {
+                SessionListView(store: store)
+
+                Divider()
+
+                bottomBar
+            }
+        } label: {
+            Image(systemName: "arrow.triangle.2.circlepath")
+        }
+        .menuBarExtraStyle(.window)
+    }
+
+    private var bottomBar: some View {
+        HStack(spacing: 12) {
+            Text("v1.0.0")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            Button {
+                restartClaude()
+            } label: {
+                Label(L10n.restartClaude, systemImage: "arrow.clockwise")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+
+            Spacer()
+
+            Toggle(isOn: $launchAtLogin) {
+                Label(L10n.launchAtLogin, systemImage: "power")
+                    .font(.caption)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .onChange(of: launchAtLogin) { _, newValue in
+                do {
+                    if newValue {
+                        try SMAppService.mainApp.register()
+                    } else {
+                        try SMAppService.mainApp.unregister()
+                    }
+                } catch {
+                    launchAtLogin = SMAppService.mainApp.status == .enabled
+                }
+            }
+
+            Button(L10n.quit) {
+                NSApplication.shared.terminate(nil)
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    private func restartClaude() {
+        let bundleId = "com.anthropic.claudefordesktop"
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+        guard let app = apps.first else {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+                NSWorkspace.shared.openApplication(at: url, configuration: .init())
+            }
+            return
+        }
+        let url = app.bundleURL
+        app.terminate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            if let url {
+                NSWorkspace.shared.openApplication(at: url, configuration: .init())
+            }
+            store.lastSyncMessage = L10n.restarted
+            store.lastSyncSuccess = true
+        }
+    }
+
+    init() {
+        _store = State(initialValue: {
+            let s = SessionStore()
+            s.scan()
+            return s
+        }())
+    }
+}
