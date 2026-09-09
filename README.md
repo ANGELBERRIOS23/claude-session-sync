@@ -59,6 +59,9 @@ App nativa de SwiftUI en la barra de menu. Sin procesos en segundo plano, sin El
 | Launch at login | Toggle to start automatically when you log in |
 | EN/ES toggle | Switch between English and Spanish in-app |
 | Multi-account | Syncs between Claude (Personal), Claude-3p (Bedrock), and multiple accounts within the same app |
+| **Vault** | Daily backup of index files **and** transcripts to a location Claude never prunes |
+| **Restore** | Put back sessions Claude has deleted, byte for byte |
+| **Auto-restore** | Every backup pass returns anything that disappeared since the last run |
 
 ### Install / Instalar
 
@@ -94,9 +97,13 @@ powershell -ExecutionPolicy Bypass -File windows\claude-session-sync.ps1
 ### Flags
 
 ```powershell
-.\claude-session-sync.ps1 -List      # List all sessions / Listar sesiones
-.\claude-session-sync.ps1 -SyncAll   # Sync everything / Sincronizar todo
-.\claude-session-sync.ps1 -Help      # Show help / Mostrar ayuda
+.\claude-session-sync.ps1 -List             # List all sessions / Listar sesiones
+.\claude-session-sync.ps1 -SyncAll          # Sync everything / Sincronizar todo
+.\claude-session-sync.ps1 -Backup           # Back up to the vault / Respaldar
+.\claude-session-sync.ps1 -RestoreMissing   # Put back what Claude deleted / Restaurar
+.\claude-session-sync.ps1 -InstallDaily     # Schedule a daily backup / Respaldo diario
+.\claude-session-sync.ps1 -VaultPath D:\backups -Backup   # Vault on another drive
+.\claude-session-sync.ps1 -Help             # Show help / Mostrar ayuda
 ```
 
 ### Interactive menu / Menu interactivo
@@ -105,10 +112,18 @@ powershell -ExecutionPolicy Bypass -File windows\claude-session-sync.ps1
 --- Claude Session Sync ---
 1. List sessions
 2. Sync all sessions
-3. Restart Claude (Personal)
-4. Restart Claude-3p (Bedrock)
-5. Quit
+3. Back up now (vault)
+4. Restore what Claude deleted
+5. Vault status
+6. Enable daily backup
+7. Disable daily backup
+8. Restart Claude (Personal)
+9. Restart Claude-3p (Bedrock)
+0. Quit
 ```
+
+> **Note:** the macOS app is tested (see below). The Windows script mirrors its logic but
+> has not been run on a Windows host yet — reports welcome.
 
 ## How it works / Cómo funciona
 
@@ -123,11 +138,37 @@ powershell -ExecutionPolicy Bypass -File windows\claude-session-sync.ps1
 
 ### What gets copied / Qué se copia
 
-**EN:** Only `local_*.json` index files. These are small (~1-5KB) and contain session metadata: title, model used, working directory, and timestamps. No conversation content. No credentials. No API keys.
+**Sync** copies only `local_*.json` index files. These are small (~1-5KB) and contain session metadata: title, model used, working directory, and timestamps. No conversation content. No credentials. No API keys.
 
-**ES:** Solo los archivos de indice `local_*.json`. Son pequenos (~1-5KB) y contienen metadatos de sesion: titulo, modelo usado, directorio de trabajo, y timestamps. Sin contenido de conversaciones. Sin credenciales. Sin API keys.
+**Sync** copia solo los archivos de indice `local_*.json`. Son pequenos (~1-5KB) y contienen metadatos de sesion: titulo, modelo usado, directorio de trabajo, y timestamps. Sin contenido de conversaciones. Sin credenciales. Sin API keys.
 
-The actual conversation transcripts live in `~/.claude/projects/` and are already shared across all accounts.
+**Vault** additionally copies the transcripts themselves, from `~/.claude/projects/`, because they do not survive on their own (see below). Credentials are never read by either feature.
+
+**Vault** ademas copia las transcripciones, desde `~/.claude/projects/`, porque no sobreviven por si solas (ver abajo). Ninguna de las dos funciones lee credenciales.
+
+## The vault / El respaldo
+
+**EN:** Sessions have two halves that Claude stores separately and prunes on different clocks: the index row the sidebar lists, and the transcript that holds the actual conversation. Either can disappear while the other survives, so the vault captures both independently and can restore either on its own.
+
+**ES:** Las sesiones tienen dos mitades que Claude guarda por separado y borra en tiempos distintos: la fila de indice que lista el sidebar, y la transcripcion con la conversacion real. Cualquiera puede desaparecer mientras la otra sobrevive, asi que el respaldo captura ambas por separado y puede restaurar cualquiera de las dos.
+
+Measured on one macOS install (2026-09-09): 92 transcripts on disk, only 10 of them referenced by an index row. **82 transcripts had no sidebar entry pointing at them.** 53 of the 92 were subagent transcripts, which sit a level deeper than the obvious path and are missed entirely by a flat scan.
+
+| Property | Behaviour |
+|---|---|
+| Location | `~/Library/Application Support/ClaudeSessionSync/Vault` by default, or any folder you pick — external drive, iCloud, Dropbox |
+| Storage | Content-addressed by SHA-256, so a daily run over unchanged transcripts writes nothing |
+| Versions | Every revision is kept, and the **largest** is pinned — a transcript Claude truncates cannot overwrite the full copy |
+| Restore | Always recovers the fullest version ever captured, not the newest |
+| Live files | Never overwritten. Claude Code appends to an open handle, so replacing the file would strand everything written afterwards; the fuller copy goes into `Vault/recovered/` instead |
+| Schedule | `launchd` on macOS, Task Scheduler on Windows — both configured to catch up after the machine was asleep |
+| Subagents | Captured, including `<slug>/<sessionId>/subagents/agent-*.jsonl` |
+
+### What it does not do / Lo que no hace
+
+This is a client-side backup. It cannot recover a session that was already gone before the first backup ran, and it does not stop Claude from pruning — it puts things back afterwards. The upstream retention behaviour is tracked in [anthropics/claude-code#92825](https://github.com/anthropics/claude-code/issues/92825).
+
+Es un respaldo del lado del cliente. No puede recuperar una sesion que ya se habia perdido antes del primer respaldo, y no impide que Claude borre — las devuelve despues.
 
 ### Important note / Nota importante
 
@@ -135,10 +176,35 @@ Synced sessions are **read-only** in terms of continuing the conversation -- you
 
 Las sesiones sincronizadas son de **solo lectura** en terminos de continuar la conversacion -- puedes verlas y leerlas, pero generar nuevas respuestas requiere las credenciales API de la cuenta original. La sesion aparece en el sidebar y puedes revisar la transcripcion completa.
 
+## Verification / Verificacion
+
+Recovery was tested against real deleted sessions on macOS 26.6, not just against index
+visibility. Each case deletes or truncates an actual transcript and checks the SHA-256 of
+what comes back.
+
+| Case | Result |
+|---|---|
+| Transcript deleted from disk | Restored to its exact path, **byte-identical** (56,850 bytes, SHA-256 match) |
+| Transcript truncated to a 36-byte stub | Live file left untouched; full 67,241-byte copy recovered into `Vault/recovered/`, **byte-identical** |
+| Subagent transcript deleted | Restored, byte-identical |
+| Backup coverage | 92 of 92 transcripts captured, including all 53 subagent transcripts |
+| Repeat backup | 21 MB written on the second run over 645 MB of transcripts (content-addressed dedupe) |
+
+Two bugs were found by these tests and fixed before release: a flat directory scan that
+missed all 53 subagent transcripts, and a single-blob-per-entry model in which a truncated
+capture overwrote the pointer to the full copy. Version history now pins the largest
+revision.
+
 ## FAQ
 
 **Q: Is this safe? / Es seguro?**
-A: Yes. It only copies tiny JSON metadata files. No passwords, tokens, or conversation data is touched.
+A: Yes. Sync copies tiny JSON metadata files. The vault additionally copies transcripts, which are your own conversation files. No passwords, tokens, or credentials are read.
+
+**Q: How big does the vault get? / Cuanto ocupa el respaldo?**
+A: Roughly the size of `~/.claude/projects` on the first run, then only what changed. Blobs are deduplicated by content hash.
+
+**Q: Can it recover a session that disappeared before I installed it?**
+A: No. It can only restore what it captured. Install it before you need it.
 
 **Q: Do I need to restart Claude after syncing?**
 A: Usually yes. Use the "Restart Claude" button in the app, or press Cmd+Q and reopen.

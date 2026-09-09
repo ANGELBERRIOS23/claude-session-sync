@@ -4,12 +4,13 @@ import ServiceManagement
 @main
 struct ClaudeSessionSyncApp: App {
     @State private var store = SessionStore()
+    @State private var vault = SessionVault()
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some Scene {
         MenuBarExtra {
             VStack(spacing: 0) {
-                SessionListView(store: store)
+                RootView(store: store, vault: vault)
 
                 Divider()
 
@@ -23,7 +24,7 @@ struct ClaudeSessionSyncApp: App {
 
     private var bottomBar: some View {
         HStack(spacing: 12) {
-            Text("v1.0.0")
+            Text("v1.1.0")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
 
@@ -86,10 +87,28 @@ struct ClaudeSessionSyncApp: App {
     }
 
     init() {
+        // launchd invokes the same binary with `--backup` for the daily pass. Handle it
+        // and exit before any window or menu bar item is created, so the scheduled run
+        // stays headless and leaves no stray icon behind.
+        if CommandLine.arguments.contains("--backup") {
+            let v = SessionVault()
+            let outcome = v.backupNow()
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            FileHandle.standardOutput.write(Data(
+                "[\(stamp)] saved=\(outcome.newEntries + outcome.updatedEntries) unchanged=\(outcome.unchanged) restored=\(outcome.restored) bytes=\(outcome.bytesWritten) errors=\(outcome.errors.count)\n".utf8
+            ))
+            exit(outcome.errors.isEmpty ? 0 : 1)
+        }
+
         _store = State(initialValue: {
             let s = SessionStore()
             s.scan()
             return s
+        }())
+        _vault = State(initialValue: {
+            let v = SessionVault()
+            v.load()
+            return v
         }())
     }
 }

@@ -2,13 +2,9 @@ import SwiftUI
 
 struct SessionListView: View {
     @Bindable var store: SessionStore
-    @State private var langRefresh = UUID()
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            Divider()
-
             if store.isScanning {
                 ProgressView(L10n.scanning)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -25,47 +21,6 @@ struct SessionListView: View {
             Divider()
             footer
         }
-        .frame(width: 520, height: 580)
-        .id(langRefresh)
-    }
-
-    private var header: some View {
-        HStack {
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .foregroundStyle(.blue)
-            Text(L10n.appTitle)
-                .font(.headline)
-
-            Spacer()
-
-            langToggle
-
-            Button {
-                store.scan()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.borderless)
-            .help(L10n.refresh)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-    }
-
-    private var langToggle: some View {
-        Button {
-            L10n.current = L10n.current == .es ? .en : .es
-            langRefresh = UUID()
-        } label: {
-            Text(L10n.current.flag)
-                .font(.caption.bold())
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(.quaternary)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-        }
-        .buttonStyle(.borderless)
-        .help(L10n.language)
     }
 
     private var sessionList: some View {
