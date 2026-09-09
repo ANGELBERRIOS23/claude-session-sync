@@ -1,6 +1,53 @@
 import Foundation
 import CryptoKit
+import Compression
 import Observation
+
+/// Blobs are deflated on the way in. Transcripts are JSONL and compress about 2x overall,
+/// though the ratio collapses on sessions carrying base64 image attachments, so a blob is
+/// only stored compressed when that actually wins.
+///
+/// A compressed blob is `<digest>.z`: an 8-byte little-endian original length followed by a
+/// raw DEFLATE stream. The digest stays the SHA-256 of the *uncompressed* bytes, so dedupe
+/// and verification are unaffected by how a blob happens to be stored.
+enum BlobCodec {
+    static func deflate(_ data: Data) -> Data? {
+        guard !data.isEmpty else { return nil }
+        let capacity = data.count + 4096
+        var out = Data(count: capacity)
+        let written = out.withUnsafeMutableBytes { dst -> Int in
+            data.withUnsafeBytes { src -> Int in
+                guard let d = dst.bindMemory(to: UInt8.self).baseAddress,
+                      let s = src.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                return compression_encode_buffer(d, capacity, s, data.count, nil, COMPRESSION_ZLIB)
+            }
+        }
+        guard written > 0 else { return nil }
+        var framed = Data(capacity: written + 8)
+        var size = UInt64(data.count).littleEndian
+        withUnsafeBytes(of: &size) { framed.append(contentsOf: $0) }
+        framed.append(out.prefix(written))
+        return framed
+    }
+
+    static func inflate(_ framed: Data) -> Data? {
+        guard framed.count > 8 else { return nil }
+        let size = framed.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+        guard size > 0, size < 4_000_000_000 else { return nil }
+        let body = framed.dropFirst(8)
+        let capacity = Int(size)
+        var out = Data(count: capacity)
+        let written = out.withUnsafeMutableBytes { dst -> Int in
+            body.withUnsafeBytes { src -> Int in
+                guard let d = dst.bindMemory(to: UInt8.self).baseAddress,
+                      let s = src.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                return compression_decode_buffer(d, capacity, s, body.count, nil, COMPRESSION_ZLIB)
+            }
+        }
+        guard written == capacity else { return nil }
+        return out
+    }
+}
 
 /// One session preserved in the vault.
 ///
@@ -148,6 +195,7 @@ struct BackupOutcome {
     /// Fuller copies written beside the vault because a live file was in the way.
     var recovered = 0
     var recoveredPaths: [String] = []
+    var bytesFreed = 0
     var errors: [String] = []
 }
 
@@ -263,20 +311,37 @@ final class SessionVault: @unchecked Sendable {
             .appendingPathComponent(digest)
     }
 
+    private func compressedBlobURL(_ digest: String) -> URL {
+        blobURL(digest).appendingPathExtension("z")
+    }
+
+    private func blobExists(_ digest: String) -> Bool {
+        fm.fileExists(atPath: compressedBlobURL(digest).path) || fm.fileExists(atPath: blobURL(digest).path)
+    }
+
     /// Stores file contents under their SHA-256. Repeated daily runs over an unchanged
     /// transcript therefore cost nothing beyond the first copy.
     @discardableResult
     private func putBlob(_ data: Data) throws -> (digest: String, wrote: Bool) {
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        if blobExists(digest) { return (digest, false) }
         let dest = blobURL(digest)
-        if fm.fileExists(atPath: dest.path) { return (digest, false) }
         try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: dest, options: .atomic)
+        // Sessions carrying base64 attachments barely deflate; storing those compressed
+        // would cost CPU on every read for nothing.
+        if let packed = BlobCodec.deflate(data), packed.count < data.count * 9 / 10 {
+            try packed.write(to: compressedBlobURL(digest), options: .atomic)
+        } else {
+            try data.write(to: dest, options: .atomic)
+        }
         return (digest, true)
     }
 
     private func readBlob(_ digest: String) -> Data? {
-        try? Data(contentsOf: blobURL(digest))
+        if let framed = try? Data(contentsOf: compressedBlobURL(digest)) {
+            return BlobCodec.inflate(framed)
+        }
+        return try? Data(contentsOf: blobURL(digest))
     }
 
     // MARK: - Backup
@@ -454,6 +519,10 @@ final class SessionVault: @unchecked Sendable {
             outcome.restored = restoreAllMissing().restored
         }
 
+        // Trimming version history leaves blobs nothing points at. Collecting them here
+        // keeps the vault from growing on every run for revisions already discarded.
+        outcome.bytesFreed = compact().total
+
         lastSuccess = outcome.errors.isEmpty
         lastMessage = outcome.errors.isEmpty
             ? L10n.backupDone(outcome.newEntries + outcome.updatedEntries, outcome.restored)
@@ -555,6 +624,84 @@ final class SessionVault: @unchecked Sendable {
             ? L10n.restoreSummary(total.restored, total.recovered)
             : L10n.syncError(total.errors.first!)
         return total
+    }
+
+    // MARK: - Compaction
+
+    struct CompactOutcome {
+        var orphansDeleted = 0
+        var orphanBytes = 0
+        var recompressed = 0
+        var compressionSaved = 0
+        var total: Int { orphanBytes + compressionSaved }
+    }
+
+    /// Reclaims space without touching anything the manifest still points at: drops blobs
+    /// no entry references any more, and deflates blobs written before compression existed.
+    @discardableResult
+    func compact() -> CompactOutcome {
+        isWorking = true
+        defer { isWorking = false }
+
+        load()
+        var outcome = CompactOutcome()
+
+        var referenced = Set<String>()
+        for entry in entries {
+            entry.transcriptBlob.map { referenced.insert($0) }
+            entry.indexBlob.map { referenced.insert($0) }
+            for v in entry.transcriptHistory ?? [] { referenced.insert(v.digest) }
+            for v in entry.indexHistory ?? [] { referenced.insert(v.digest) }
+        }
+
+        guard let walker = fm.enumerator(at: blobsRoot, includingPropertiesForKeys: [.fileSizeKey]) else {
+            return outcome
+        }
+
+        for case let file as URL in walker where file.hasDirectoryPath == false {
+            let name = file.lastPathComponent
+            let digest = file.pathExtension == "z" ? file.deletingPathExtension().lastPathComponent : name
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+
+            if !referenced.contains(digest) {
+                if (try? fm.removeItem(at: file)) != nil {
+                    outcome.orphansDeleted += 1
+                    outcome.orphanBytes += size
+                }
+                continue
+            }
+
+            guard file.pathExtension != "z",
+                  let raw = try? Data(contentsOf: file),
+                  let packed = BlobCodec.deflate(raw),
+                  packed.count < raw.count * 9 / 10 else { continue }
+
+            do {
+                try packed.write(to: compressedBlobURL(digest), options: .atomic)
+                try fm.removeItem(at: file)
+                outcome.recompressed += 1
+                outcome.compressionSaved += raw.count - packed.count
+            } catch {
+                try? fm.removeItem(at: compressedBlobURL(digest))
+            }
+        }
+
+        lastSuccess = true
+        lastMessage = L10n.compacted(outcome.total)
+        return outcome
+    }
+
+    var onDiskBytes: Int {
+        guard let walker = fm.enumerator(at: vaultRoot, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var total = 0
+        for case let file as URL in walker where file.hasDirectoryPath == false {
+            total += (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        }
+        return total
+    }
+
+    var onDiskFormatted: String {
+        ByteCountFormatter.string(fromByteCount: Int64(onDiskBytes), countStyle: .file)
     }
 
     // MARK: - Daily schedule (launchd)

@@ -90,12 +90,22 @@ struct ClaudeSessionSyncApp: App {
         // launchd invokes the same binary with `--backup` for the daily pass. Handle it
         // and exit before any window or menu bar item is created, so the scheduled run
         // stays headless and leaves no stray icon behind.
+        let stamp = ISO8601DateFormatter().string(from: Date())
+
+        if CommandLine.arguments.contains("--compact") {
+            let v = SessionVault()
+            let c = v.compact()
+            FileHandle.standardOutput.write(Data(
+                "[\(stamp)] orphans=\(c.orphansDeleted) recompressed=\(c.recompressed) freed=\(c.total) remaining=\(v.onDiskBytes)\n".utf8
+            ))
+            exit(0)
+        }
+
         if CommandLine.arguments.contains("--backup") {
             let v = SessionVault()
             let outcome = v.backupNow()
-            let stamp = ISO8601DateFormatter().string(from: Date())
             FileHandle.standardOutput.write(Data(
-                "[\(stamp)] saved=\(outcome.newEntries + outcome.updatedEntries) unchanged=\(outcome.unchanged) restored=\(outcome.restored) bytes=\(outcome.bytesWritten) errors=\(outcome.errors.count)\n".utf8
+                "[\(stamp)] saved=\(outcome.newEntries + outcome.updatedEntries) unchanged=\(outcome.unchanged) restored=\(outcome.restored) bytes=\(outcome.bytesWritten) freed=\(outcome.bytesFreed) errors=\(outcome.errors.count)\n".utf8
             ))
             exit(outcome.errors.isEmpty ? 0 : 1)
         }

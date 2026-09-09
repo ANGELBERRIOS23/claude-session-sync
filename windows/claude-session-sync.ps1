@@ -7,6 +7,7 @@ param(
     [switch]$List,
     [switch]$Backup,
     [switch]$RestoreMissing,
+    [switch]$Compact,
     [switch]$InstallDaily,
     [switch]$RemoveDaily,
     [string]$VaultPath,
@@ -149,6 +150,40 @@ function Save-Manifest {
     $Manifest | ConvertTo-Json -Depth 10 | Set-Content $ManifestPath -Encoding UTF8
 }
 
+# A compressed blob is <digest>.z: an 8-byte little-endian original length followed by a
+# raw DEFLATE stream. The digest stays the SHA-256 of the uncompressed bytes, so dedupe and
+# verification do not depend on how a blob happens to be stored. Same format as the macOS app.
+function Compress-Blob {
+    param([byte[]]$Bytes)
+    $ms = New-Object IO.MemoryStream
+    $ds = New-Object IO.Compression.DeflateStream($ms, [IO.Compression.CompressionLevel]::Optimal)
+    $ds.Write($Bytes, 0, $Bytes.Length); $ds.Dispose()
+    $body = $ms.ToArray(); $ms.Dispose()
+    $header = [BitConverter]::GetBytes([UInt64]$Bytes.Length)
+    if (-not [BitConverter]::IsLittleEndian) { [Array]::Reverse($header) }
+    return $header + $body
+}
+
+function Expand-Blob {
+    param([byte[]]$Framed)
+    if ($Framed.Length -le 8) { return $null }
+    $header = $Framed[0..7]
+    if (-not [BitConverter]::IsLittleEndian) { [Array]::Reverse($header) }
+    $size = [BitConverter]::ToUInt64($header, 0)
+    $ms = New-Object IO.MemoryStream (, $Framed[8..($Framed.Length - 1)])
+    $ds = New-Object IO.Compression.DeflateStream($ms, [IO.Compression.CompressionMode]::Decompress)
+    $out = New-Object byte[] $size
+    $read = 0
+    while ($read -lt $size) {
+        $n = $ds.Read($out, $read, $size - $read)
+        if ($n -le 0) { break }
+        $read += $n
+    }
+    $ds.Dispose(); $ms.Dispose()
+    if ($read -ne $size) { return $null }
+    return $out
+}
+
 # Blobs are stored under their SHA-256, so a daily run over an unchanged transcript
 # costs nothing beyond the first copy.
 function Add-Blob {
@@ -156,18 +191,76 @@ function Add-Blob {
     $hash = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLower()
     $dir = Join-Path $BlobsRoot $hash.Substring(0, 2)
     $dest = Join-Path $dir $hash
-    $wrote = $false
-    if (-not (Test-Path $dest)) {
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        Copy-Item $Path $dest
-        $wrote = $true
+    $destZ = "$dest.z"
+    $size = (Get-Item $Path).Length
+    if ((Test-Path $dest) -or (Test-Path $destZ)) {
+        return [PSCustomObject]@{ Digest = $hash; Wrote = $false; Bytes = $size }
     }
-    return [PSCustomObject]@{ Digest = $hash; Wrote = $wrote; Bytes = (Get-Item $Path).Length }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $raw = [IO.File]::ReadAllBytes($Path)
+    $packed = Compress-Blob $raw
+    # Sessions carrying base64 attachments barely deflate; storing those compressed would
+    # cost CPU on every read for nothing.
+    if ($packed.Length -lt ($raw.Length * 0.9)) {
+        [IO.File]::WriteAllBytes($destZ, $packed)
+    } else {
+        Copy-Item $Path $dest
+    }
+    return [PSCustomObject]@{ Digest = $hash; Wrote = $true; Bytes = $size }
 }
 
 function Get-BlobPath {
     param([string]$Digest)
     return Join-Path (Join-Path $BlobsRoot $Digest.Substring(0, 2)) $Digest
+}
+
+# Writes a blob's original content to $Destination, transparently inflating if needed.
+function Copy-BlobTo {
+    param([string]$Digest, [string]$Destination)
+    $plain = Get-BlobPath $Digest
+    $packed = "$plain.z"
+    if (Test-Path $packed) {
+        $out = Expand-Blob ([IO.File]::ReadAllBytes($packed))
+        if ($null -eq $out) { return $false }
+        [IO.File]::WriteAllBytes($Destination, $out)
+        return $true
+    }
+    if (Test-Path $plain) { Copy-Item $plain $Destination; return $true }
+    return $false
+}
+
+# Drops blobs no entry references any more, and deflates blobs written before compression
+# existed. Never touches anything the manifest still points at.
+function Invoke-Compact {
+    $manifest = Get-Manifest
+    $referenced = New-Object Collections.Generic.HashSet[string]
+    foreach ($e in $manifest.entries) {
+        foreach ($d in @($e.transcriptBlob, $e.indexBlob)) { if ($d) { [void]$referenced.Add($d) } }
+        foreach ($h in @($e.transcriptHistory) + @($e.indexHistory)) {
+            if ($h) { foreach ($v in $h) { if ($v.digest) { [void]$referenced.Add($v.digest) } } }
+        }
+    }
+
+    $orphans = 0; $freed = 0; $recompressed = 0
+    if (Test-Path $BlobsRoot) {
+        foreach ($f in (Get-ChildItem $BlobsRoot -Recurse -File)) {
+            $digest = if ($f.Extension -eq ".z") { $f.BaseName } else { $f.Name }
+            if (-not $referenced.Contains($digest)) {
+                $freed += $f.Length; $orphans++
+                Remove-Item $f.FullName -Force
+                continue
+            }
+            if ($f.Extension -eq ".z") { continue }
+            $raw = [IO.File]::ReadAllBytes($f.FullName)
+            $packed = Compress-Blob $raw
+            if ($packed.Length -lt ($raw.Length * 0.9)) {
+                [IO.File]::WriteAllBytes("$($f.FullName).z", $packed)
+                Remove-Item $f.FullName -Force
+                $freed += ($raw.Length - $packed.Length); $recompressed++
+            }
+        }
+    }
+    Write-Host "  Removed $orphans orphan blob(s), compressed $recompressed, freed $([math]::Round($freed / 1MB, 1)) MB" -ForegroundColor Green
 }
 
 # Keeps recent revisions plus the largest ever seen. The largest is pinned because it is
@@ -293,12 +386,13 @@ function Invoke-RestoreMissing {
         if ($best -and $e.transcriptRelPath) {
             $live = Join-Path $ProjectsRoot $e.transcriptRelPath
             $src = Get-BlobPath $best.digest
-            if (Test-Path $src) {
+            if ((Test-Path $src) -or (Test-Path "$src.z")) {
                 if (-not (Test-Path $live)) {
                     New-Item -ItemType Directory -Force -Path (Split-Path $live) | Out-Null
-                    Copy-Item $src $live
-                    Write-Host "  Restored: $($e.title)" -ForegroundColor Green
-                    $restored++
+                    if (Copy-BlobTo $best.digest $live) {
+                        Write-Host "  Restored: $($e.title)" -ForegroundColor Green
+                        $restored++
+                    }
                 }
                 elseif ((Get-Item $live).Length -lt $best.bytes) {
                     # Claude Code appends to an open handle; replacing the live file would
@@ -308,9 +402,10 @@ function Invoke-RestoreMissing {
                     New-Item -ItemType Directory -Force -Path $dir | Out-Null
                     $stem = [IO.Path]::GetFileNameWithoutExtension($e.transcriptRelPath)
                     $name = "$stem-recovered-$((Get-Date).ToString('yyyyMMdd-HHmmss')).jsonl"
-                    Copy-Item $src (Join-Path $dir $name)
-                    Write-Host "  Truncated on disk, fuller copy saved: $($e.title)" -ForegroundColor Yellow
-                    $recovered++
+                    if (Copy-BlobTo $best.digest (Join-Path $dir $name)) {
+                        Write-Host "  Truncated on disk, fuller copy saved: $($e.title)" -ForegroundColor Yellow
+                        $recovered++
+                    }
                 }
             }
         }
@@ -322,10 +417,9 @@ function Invoke-RestoreMissing {
         if ($bestIdx -and $e.indexDir -and $e.indexFileName) {
             $live = Join-Path $e.indexDir $e.indexFileName
             $src = Get-BlobPath $bestIdx.digest
-            if ((Test-Path $src) -and -not (Test-Path $live)) {
+            if (-not (Test-Path $live)) {
                 New-Item -ItemType Directory -Force -Path $e.indexDir | Out-Null
-                Copy-Item $src $live
-                $restored++
+                if (Copy-BlobTo $bestIdx.digest $live) { $restored++ }
             }
         }
     }
@@ -400,7 +494,7 @@ function Show-Menu {
         Write-Host "2. Sync all sessions"
         Write-Host "3. Back up now (vault)"
         Write-Host "4. Restore what Claude deleted"
-        Write-Host "5. Vault status"
+        Write-Host "5. Vault status / reclaim space"
         Write-Host "6. Enable daily backup"
         Write-Host "7. Disable daily backup"
         Write-Host "8. Restart Claude (Personal)"
@@ -413,7 +507,7 @@ function Show-Menu {
             "2" { Sync-AllSessions }
             "3" { Invoke-Backup | Out-Null }
             "4" { Invoke-RestoreMissing }
-            "5" { Show-VaultStatus }
+            "5" { Show-VaultStatus; Invoke-Compact }
             "6" { Install-DailyTask }
             "7" { Remove-DailyTask }
             "8" { Restart-Claude "Claude" }
@@ -432,6 +526,7 @@ if ($Help) {
     Write-Host "  .\claude-session-sync.ps1 -SyncAll         Sync all sessions"
     Write-Host "  .\claude-session-sync.ps1 -Backup          Back up sessions to the vault"
     Write-Host "  .\claude-session-sync.ps1 -RestoreMissing  Put back what Claude deleted"
+    Write-Host "  .\claude-session-sync.ps1 -Compact         Reclaim space in the vault"
     Write-Host "  .\claude-session-sync.ps1 -InstallDaily    Schedule a daily backup"
     Write-Host "  .\claude-session-sync.ps1 -RemoveDaily     Remove the scheduled backup"
     Write-Host "  -VaultPath <dir>   Keep the vault elsewhere (external or synced drive)"
@@ -440,7 +535,8 @@ if ($Help) {
 
 if ($InstallDaily) { Install-DailyTask; exit 0 }
 if ($RemoveDaily) { Remove-DailyTask; exit 0 }
-if ($Backup) { Invoke-Backup | Out-Null }
+if ($Compact) { Invoke-Compact; exit 0 }
+if ($Backup) { Invoke-Backup | Out-Null; Invoke-Compact }
 if ($RestoreMissing) { Invoke-RestoreMissing }
 if ($Backup -or $RestoreMissing) { exit 0 }
 if ($List) { Show-Sessions; exit 0 }

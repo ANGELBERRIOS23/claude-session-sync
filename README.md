@@ -158,6 +158,8 @@ Measured on one macOS install (2026-09-09): 92 transcripts on disk, only 10 of t
 |---|---|
 | Location | `~/Library/Application Support/ClaudeSessionSync/Vault` by default, or any folder you pick — external drive, iCloud, Dropbox |
 | Storage | Content-addressed by SHA-256, so a daily run over unchanged transcripts writes nothing |
+| Compression | Blobs are deflated. 645 MB of transcripts occupy 344 MB. Sessions holding base64 attachments are stored raw, since they do not deflate and would cost CPU on every read for nothing |
+| Compaction | Blobs no entry references any more are deleted on every backup, so trimmed version history does not accumulate |
 | Versions | Every revision is kept, and the **largest** is pinned — a transcript Claude truncates cannot overwrite the full copy |
 | Restore | Always recovers the fullest version ever captured, not the newest |
 | Live files | Never overwritten. Claude Code appends to an open handle, so replacing the file would strand everything written afterwards; the fuller copy goes into `Vault/recovered/` instead |
@@ -201,7 +203,10 @@ revision.
 A: Yes. Sync copies tiny JSON metadata files. The vault additionally copies transcripts, which are your own conversation files. No passwords, tokens, or credentials are read.
 
 **Q: How big does the vault get? / Cuanto ocupa el respaldo?**
-A: Roughly the size of `~/.claude/projects` on the first run, then only what changed. Blobs are deduplicated by content hash.
+A: About half the size of `~/.claude/projects`, then only what changed. On the test install, 645 MB of transcripts became a 344 MB vault. Blobs are deduplicated by content hash and deflated. Use `--compact` (or the **Reclaim space** button) to sweep unreferenced blobs and compress anything left over from an older version.
+
+**Q: My disk is nearly full. / Casi no tengo espacio.**
+A: Point the vault at another drive with **Change location** in the app, or `-VaultPath D:\backups` on Windows. The vault is a plain directory and can live on an external or synced volume.
 
 **Q: Can it recover a session that disappeared before I installed it?**
 A: No. It can only restore what it captured. Install it before you need it.

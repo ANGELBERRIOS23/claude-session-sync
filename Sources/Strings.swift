@@ -183,6 +183,14 @@ enum L10n {
     static var truncated: String {
         current == .es ? "Recortada en disco" : "Truncated on disk"
     }
+    static var compact: String {
+        current == .es ? "Liberar espacio" : "Reclaim space"
+    }
+    static func compacted(_ bytes: Int) -> String {
+        if bytes <= 0 { return current == .es ? "Nada que liberar" : "Nothing to reclaim" }
+        let s = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        return current == .es ? "\(s) liberados" : "\(s) reclaimed"
+    }
     static func backupDone(_ saved: Int, _ restored: Int) -> String {
         if restored > 0 {
             return current == .es

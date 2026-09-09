@@ -5,11 +5,14 @@ struct VaultView: View {
     @Bindable var vault: SessionVault
     @State private var autoRestore: Bool
     @State private var dailyOn: Bool
+    /// Cached because measuring it walks the whole vault.
+    @State private var diskSize: String
 
     init(vault: SessionVault) {
         self.vault = vault
         _autoRestore = State(initialValue: vault.autoRestore)
         _dailyOn = State(initialValue: vault.isDailyInstalled)
+        _diskSize = State(initialValue: vault.onDiskFormatted)
     }
 
     var body: some View {
@@ -98,7 +101,9 @@ struct VaultView: View {
 
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("\(L10n.backedUpCount(vault.entries.count)) · \(vault.totalBytesFormatted)")
+                    // Shows what the vault actually occupies, which is below the sum of the
+                    // original file sizes once blobs are deflated.
+                    Text("\(L10n.backedUpCount(vault.entries.count)) · \(diskSize)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(vault.lastBackupAt.map { L10n.lastBackup($0) } ?? L10n.neverBackedUp)
@@ -107,6 +112,12 @@ struct VaultView: View {
                 }
 
                 Spacer()
+
+                Button(L10n.compact) {
+                    vault.compact()
+                    diskSize = vault.onDiskFormatted
+                }
+                .disabled(vault.isWorking)
 
                 if vault.recoverableCount > 0 {
                     Button(L10n.restoreAll) {
