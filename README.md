@@ -63,7 +63,13 @@ App nativa de SwiftUI en la barra de menu. Sin procesos en segundo plano, sin El
 | **Restore** | Put back sessions Claude has deleted, byte for byte |
 | **Auto-restore** | Every backup pass returns anything that disappeared since the last run |
 
-### Install / Instalar
+### Download / Descargar
+
+**EN:** Grab `ClaudeSessionSync-vX.Y.Z-macOS.zip` from [Releases](https://github.com/ANGELBERRIOS23/claude-session-sync/releases), unzip it and move the app to `/Applications`. It is not notarized, so the first time macOS blocks it: open **System Settings > Privacy & Security** and click **Open Anyway**. GitHub Actions builds every release; nothing has to be compiled on your Mac.
+
+**ES:** Descarga `ClaudeSessionSync-vX.Y.Z-macOS.zip` desde [Releases](https://github.com/ANGELBERRIOS23/claude-session-sync/releases), descomprímelo y mueve la app a `/Applications`. No está notarizada, así que la primera vez macOS la bloquea: abre **Ajustes del Sistema > Privacidad y seguridad** y dale **Abrir de todos modos**. GitHub Actions compila cada versión; no hace falta compilar nada en tu Mac.
+
+### Build from source / Compilar desde el código
 
 **Requirements:** macOS 14+ and Swift 6.0+ (comes with Xcode Command Line Tools).
 

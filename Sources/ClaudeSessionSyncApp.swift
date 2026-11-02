@@ -24,7 +24,7 @@ struct ClaudeSessionSyncApp: App {
 
     private var bottomBar: some View {
         HStack(spacing: 12) {
-            Text("v1.1.0")
+            Text("v1.1.1")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
 

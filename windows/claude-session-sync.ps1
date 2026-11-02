@@ -61,15 +61,17 @@ function Get-Sessions {
 }
 
 function Show-Sessions {
-    $claudeDirs = Get-SessionDirs $ClaudeBase
-    $claude3pDirs = Get-SessionDirs $Claude3pBase
+    $claudeDirs = @(Get-SessionDirs $ClaudeBase)
+    $claude3pDirs = @(Get-SessionDirs $Claude3pBase)
+    $allDirs = $claudeDirs + $claude3pDirs
 
     Write-Host "`n=== Claude (Personal) ===" -ForegroundColor Cyan
     foreach ($d in $claudeDirs) {
         $sessions = Get-Sessions $d
         foreach ($s in $sessions) {
             $synced = $false
-            foreach ($td in $claude3pDirs) {
+            foreach ($td in $allDirs) {
+                if ($td -eq $d) { continue }
                 if (Test-Path (Join-Path $td $s.File.Name)) { $synced = $true; break }
             }
             $status = if ($synced) { "[synced]" } else { "[not synced]" }
@@ -83,7 +85,8 @@ function Show-Sessions {
         $sessions = Get-Sessions $d
         foreach ($s in $sessions) {
             $synced = $false
-            foreach ($td in $claudeDirs) {
+            foreach ($td in $allDirs) {
+                if ($td -eq $d) { continue }
                 if (Test-Path (Join-Path $td $s.File.Name)) { $synced = $true; break }
             }
             $status = if ($synced) { "[synced]" } else { "[not synced]" }
@@ -94,32 +97,23 @@ function Show-Sessions {
 }
 
 function Sync-AllSessions {
-    $claudeDirs = Get-SessionDirs $ClaudeBase
-    $claude3pDirs = Get-SessionDirs $Claude3pBase
+    # Every account folder, from both apps, receives the sessions of every other one.
+    # A new account starts with an empty folder, and it is the one that needs them most.
+    $allDirs = @(Get-SessionDirs $ClaudeBase) + @(Get-SessionDirs $Claude3pBase)
     $copied = 0
 
-    foreach ($srcDir in $claudeDirs) {
+    foreach ($srcDir in $allDirs) {
         $sessions = Get-Sessions $srcDir
         foreach ($s in $sessions) {
-            foreach ($dstDir in $claude3pDirs) {
+            $uuid = $s.File.BaseName -replace '^local_', ''
+            foreach ($dstDir in $allDirs) {
+                if ($dstDir -eq $srcDir) { continue }
                 $dest = Join-Path $dstDir $s.File.Name
-                if (-not (Test-Path $dest)) {
+                # Claude leaves deleted_<uuid> when a session is deleted; don't bring it back.
+                $deleted = Join-Path $dstDir "deleted_$uuid"
+                if (-not (Test-Path $dest) -and -not (Test-Path $deleted)) {
                     Copy-Item $s.File.FullName $dest
-                    Write-Host "  Copied to Bedrock: $($s.Title)" -ForegroundColor Green
-                    $copied++
-                }
-            }
-        }
-    }
-
-    foreach ($srcDir in $claude3pDirs) {
-        $sessions = Get-Sessions $srcDir
-        foreach ($s in $sessions) {
-            foreach ($dstDir in $claudeDirs) {
-                $dest = Join-Path $dstDir $s.File.Name
-                if (-not (Test-Path $dest)) {
-                    Copy-Item $s.File.FullName $dest
-                    Write-Host "  Copied to Personal: $($s.Title)" -ForegroundColor Green
+                    Write-Host "  Copied: $($s.Title)" -ForegroundColor Green
                     $copied++
                 }
             }

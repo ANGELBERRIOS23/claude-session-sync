@@ -8,7 +8,7 @@ struct SessionListView: View {
             if store.isScanning {
                 ProgressView(L10n.scanning)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if store.groups.isEmpty {
+            } else if store.groups.allSatisfy({ $0.sessions.isEmpty }) {
                 ContentUnavailableView(
                     L10n.noSessions,
                     systemImage: "tray",
@@ -50,6 +50,10 @@ struct SessionListView: View {
                         Image(systemName: group.appLabel.contains("Bedrock") ? "cloud" : "person")
                         Text(group.appLabel)
                             .font(.subheadline.bold())
+                        // Several accounts share the same app label; the folder id tells them apart.
+                        Text(String(group.accountUUID.prefix(8)))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
                         Spacer()
                         Text(L10n.sessions(group.sessions.count))
                             .font(.caption)

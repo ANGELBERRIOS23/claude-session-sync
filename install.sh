@@ -3,13 +3,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Claude Session Sync"
-APP_BUNDLE="/Applications/${APP_NAME}.app"
+VERSION="1.1.1"
+# CI builds the bundle into its own folder instead of /Applications.
+APP_DIR="${APP_DIR:-/Applications}"
+APP_BUNDLE="${APP_DIR}/${APP_NAME}.app"
+
+BUILD_FLAGS=(-c release -Xswiftc -swift-version -Xswiftc 5)
+# UNIVERSAL=1 builds one binary for Apple Silicon and Intel (used for releases).
+if [ "${UNIVERSAL:-0}" = 1 ]; then
+    BUILD_FLAGS+=(--arch arm64 --arch x86_64)
+fi
 
 echo "Building release binary..."
 cd "$SCRIPT_DIR"
-swift build -c release -Xswiftc -swift-version -Xswiftc 5 2>&1 | tail -3
+swift build "${BUILD_FLAGS[@]}" 2>&1 | tail -3
 
-BINARY="$SCRIPT_DIR/.build/release/ClaudeSessionSync"
+BINARY="$(swift build "${BUILD_FLAGS[@]}" --show-bin-path)/ClaudeSessionSync"
 if [ ! -f "$BINARY" ]; then
     echo "Build failed."
     exit 1
@@ -26,7 +35,7 @@ if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
     cp "$SCRIPT_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
-cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
+cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -42,9 +51,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>${VERSION}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -58,6 +67,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+# Ad-hoc sign the whole bundle so macOS treats the binary, icon and Info.plist as one app.
+codesign --force --deep --sign - "$APP_BUNDLE"
 
 echo ""
 echo "Done! Installed at: $APP_BUNDLE"
