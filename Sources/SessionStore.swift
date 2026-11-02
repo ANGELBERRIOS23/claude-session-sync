@@ -46,16 +46,16 @@ final class SessionStore: @unchecked Sendable {
                     let sessions = sessionFiles.compactMap { parseSession(from: $0) }
                         .sorted { ($0.lastActivityAt ?? .distantPast) > ($1.lastActivityAt ?? .distantPast) }
 
-                    if !sessions.isEmpty {
-                        result.append(AccountGroup(
-                            appLabel: app.label,
-                            appBase: base,
-                            accountUUID: accountDir.lastPathComponent,
-                            orgUUID: orgDir.lastPathComponent,
-                            orgPath: orgDir,
-                            sessions: sessions
-                        ))
-                    }
+                    // Empty folders are kept: an account you just switched to has no
+                    // sessions yet, and it is the one that needs them the most.
+                    result.append(AccountGroup(
+                        appLabel: app.label,
+                        appBase: base,
+                        accountUUID: accountDir.lastPathComponent,
+                        orgUUID: orgDir.lastPathComponent,
+                        orgPath: orgDir,
+                        sessions: sessions
+                    ))
                 }
             }
         }
@@ -76,7 +76,17 @@ final class SessionStore: @unchecked Sendable {
         groups.filter { $0.id != sourceGroup.id }
             .filter { target in
                 !target.sessions.contains { $0.sessionId == session.sessionId }
+                    && !isDeleted(session, in: target)
             }
+    }
+
+    /// Claude leaves a `deleted_<uuid>` marker when a session is deleted from an account.
+    /// Copying the index back there would bring the deleted session back to the sidebar.
+    private func isDeleted(_ session: SessionInfo, in group: AccountGroup) -> Bool {
+        let uuid = session.sessionId.hasPrefix("local_")
+            ? String(session.sessionId.dropFirst("local_".count))
+            : session.sessionId
+        return fm.fileExists(atPath: group.orgPath.appendingPathComponent("deleted_\(uuid)").path)
     }
 
     func syncSelected() {
@@ -97,7 +107,7 @@ final class SessionStore: @unchecked Sendable {
             let targets = snap.filter { $0.id != sourceGroup.id }
             for target in targets {
                 let destFile = target.orgPath.appendingPathComponent(session.sourceFile.lastPathComponent)
-                guard !fm.fileExists(atPath: destFile.path) else { continue }
+                guard !fm.fileExists(atPath: destFile.path), !isDeleted(session, in: target) else { continue }
                 do {
                     try fm.copyItem(at: session.sourceFile, to: destFile)
                     copied += 1
@@ -106,6 +116,9 @@ final class SessionStore: @unchecked Sendable {
                 }
             }
         }
+
+        // Rescan before writing the result: scan() clears the message.
+        scan()
 
         if !errors.isEmpty {
             lastSyncMessage = L10n.syncError(errors.first!)
@@ -117,8 +130,6 @@ final class SessionStore: @unchecked Sendable {
             lastSyncMessage = L10n.nothingToSync
             lastSyncSuccess = true
         }
-
-        scan()
     }
 
     func syncAll() {
@@ -135,7 +146,7 @@ final class SessionStore: @unchecked Sendable {
             for session in sourceGroup.sessions {
                 for target in targets {
                     let destFile = target.orgPath.appendingPathComponent(session.sourceFile.lastPathComponent)
-                    guard !fm.fileExists(atPath: destFile.path) else { continue }
+                    guard !fm.fileExists(atPath: destFile.path), !isDeleted(session, in: target) else { continue }
                     do {
                         try fm.copyItem(at: session.sourceFile, to: destFile)
                         copied += 1
@@ -145,6 +156,8 @@ final class SessionStore: @unchecked Sendable {
                 }
             }
         }
+
+        scan()
 
         if !errors.isEmpty {
             lastSyncMessage = L10n.syncError(errors.first!)
@@ -156,8 +169,6 @@ final class SessionStore: @unchecked Sendable {
             lastSyncMessage = L10n.allSynced
             lastSyncSuccess = true
         }
-
-        scan()
     }
 
     func unsync(_ session: SessionInfo, from group: AccountGroup) {
@@ -179,9 +190,9 @@ final class SessionStore: @unchecked Sendable {
         }
 
         if removed > 0 {
+            scan()
             lastSyncMessage = L10n.removedCount(removed)
             lastSyncSuccess = true
-            scan()
         }
     }
 }
